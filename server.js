@@ -126,7 +126,7 @@ function checkRateLimit(ip) {
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
-    version: "2.1",
+    version: "2.2",
     pagespeedFallbackMode,
     cacheSize: scanCache.size,
     monitoredCount: monitoredUrls.size,
@@ -523,6 +523,146 @@ cron.schedule("0 8 * * *", async () => {
 });
 
 // ─────────────────────────────────────────────
+// HIPAA REVIEW SCANNER
+// ─────────────────────────────────────────────
+
+const HIPAA_HIGH = [
+  { r: /\b(as your|you are|you were)\s+(our\s+)?(patient|client)\b/gi, v: 'Directly confirms patient/client relationship' },
+  { r: /\bour\s+(patient|client)\b/gi, v: 'Directly confirms patient status' },
+  { r: /\byour\s+(treatment|procedure|appointment|surgery|diagnosis|prescription|medication)\b/gi, v: 'References patient medical information' },
+  { r: /\byour\s+(insurance|coverage|co-pay|copay|bill|payment|balance|claim)\b/gi, v: 'References patient financial/insurance info (PHI)' },
+  { r: /\bour\s+(records|chart|file)\s+(show|indicate)\b/gi, v: 'Implies access to patient records' },
+  { r: /\b(root canal|crown|filling|extraction|surgery|chemotherapy|dialysis|implant|biopsy)\b/gi, v: 'Mentions specific medical/dental procedure' },
+  { r: /\bwhen you (came in|visited us|were here|had your)\b/gi, v: 'References specific patient visit' },
+  { r: /\byour (condition|diagnosis|symptoms|illness|treatment plan)\b/gi, v: 'References patient medical condition (PHI)' },
+];
+
+const HIPAA_MEDIUM = [
+  { r: /\byour (specific |)(concerns|issues|complaints)\b/gi, v: 'Implies specific knowledge of patient concerns' },
+  { r: /\bas we (discussed|mentioned|spoke about)\b/gi, v: 'References prior private communication' },
+  { r: /\byour experience with (us|our office|our practice)\b/gi, v: 'May imply confirmed patient relationship' },
+  { r: /\bwe understand your (frustration|concern|situation)\b/gi, v: 'Implies specific knowledge of patient situation' },
+  { r: /\bwe (see|note|noticed) that\b/gi, v: 'May imply access to patient records' },
+];
+
+function analyzeHipaaResponse(responseText) {
+  if (!responseText || !responseText.trim()) return { risk: 'NO_RESPONSE', violations: [], score: 0 };
+  const violations = [];
+  let score = 0;
+  for (const p of HIPAA_HIGH) {
+    if (p.r.test(responseText)) { violations.push({ severity: 'HIGH', message: p.v }); score += 30; }
+    p.r.lastIndex = 0;
+  }
+  for (const p of HIPAA_MEDIUM) {
+    if (p.r.test(responseText)) { violations.push({ severity: 'MEDIUM', message: p.v }); score += 12; }
+    p.r.lastIndex = 0;
+  }
+  score = Math.min(100, score);
+  const risk = violations.some(v => v.severity === 'HIGH') ? 'HIGH'
+    : violations.some(v => v.severity === 'MEDIUM') ? 'MEDIUM'
+    : score > 0 ? 'LOW' : 'CLEAN';
+  return { risk, violations, score };
+}
+
+function generateSafeResponse(rating) {
+  if (rating >= 4) return 'Thank you so much for taking the time to share your experience! We are committed to providing excellent care to our community and look forward to seeing you again!';
+  if (rating === 3) return 'Thank you for sharing your feedback. We strive to provide the best possible experience and appreciate you letting us know how we can improve. Please contact our office directly — we\'d love the opportunity to make things right.';
+  return 'We appreciate you taking the time to share your experience and are sorry to hear you were not fully satisfied. Please contact our office at your convenience so we can address your concerns.';
+}
+
+function extractPlaceId(input) {
+  if (!input) return null;
+  input = input.trim();
+  if (/^ChIJ[a-zA-Z0-9_-]{20,}$/.test(input)) return input;
+  const m1 = input.match(/!1s(ChIJ[a-zA-Z0-9_-]+)!/); if (m1) return m1[1];
+  const m2 = input.match(/[?&]place_id=([a-zA-Z0-9_-]+)/); if (m2) return m2[1];
+  const m3 = input.match(/maps\/place\/[^/]+\/@[^/]+\/([0-9]+[a-z]\/[0-9]+[a-z]\/[^/!]+)/);
+  return null;
+}
+
+app.post('/scan-reviews', async (req, res) => {
+  const { placeId, mapsUrl } = req.body;
+  const resolved = placeId || extractPlaceId(mapsUrl);
+  if (!resolved) {
+    return res.status(400).json({ error: 'Could not extract Place ID. Please paste the Place ID directly (starts with ChIJ...).' });
+  }
+
+  const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
+  if (!checkRateLimit(ip)) return res.status(429).json({ error: 'Too many scans. Please wait and try again.' });
+
+  const apiKey = process.env.GOOGLE_PLACES_API_KEY;
+  if (!apiKey) return res.status(503).json({ error: 'GOOGLE_PLACES_API_KEY not configured on the server.' });
+
+  try {
+    const url = `https://maps.googleapis.com/maps/api/place/details/json?place_id=${encodeURIComponent(resolved)}&fields=name,rating,user_ratings_total,formatted_address,reviews&key=${apiKey}&reviews_sort=newest`;
+    const r = await fetch(url, { signal: AbortSignal.timeout(15000) });
+    const data = await r.json();
+
+    if (data.status === 'NOT_FOUND' || data.status === 'INVALID_REQUEST') {
+      return res.status(400).json({ error: `Place not found. Check the Place ID or URL (API status: ${data.status}).` });
+    }
+    if (data.status !== 'OK') {
+      return res.status(400).json({ error: `Google Places API error: ${data.status}` });
+    }
+
+    const place = data.result;
+    const reviews = place.reviews || [];
+
+    const analyzed = reviews.map(rv => {
+      const responseText = rv.author_reply?.text || null;
+      const analysis = analyzeHipaaResponse(responseText);
+      return {
+        author: rv.author_name,
+        rating: rv.rating,
+        reviewText: rv.text,
+        reviewTime: rv.relative_time_description,
+        response: responseText,
+        hipaaRisk: analysis.risk,
+        violations: analysis.violations,
+        riskScore: analysis.score,
+        safeResponse: generateSafeResponse(rv.rating),
+      };
+    });
+
+    const withResponses = analyzed.filter(r => r.response);
+    const avgScore = withResponses.length
+      ? Math.round(withResponses.reduce((s, r) => s + r.riskScore, 0) / withResponses.length)
+      : 0;
+    const overallRiskLevel = avgScore > 60 ? 'HIGH' : avgScore > 30 ? 'MEDIUM' : avgScore > 0 ? 'LOW' : 'CLEAN';
+
+    res.json({
+      success: true,
+      businessName: place.name,
+      businessRating: place.rating,
+      totalRatings: place.user_ratings_total,
+      address: place.formatted_address,
+      overallRiskScore: avgScore,
+      overallRiskLevel,
+      riskSummary: {
+        high: withResponses.filter(r => r.hipaaRisk === 'HIGH').length,
+        medium: withResponses.filter(r => r.hipaaRisk === 'MEDIUM').length,
+        clean: withResponses.filter(r => r.hipaaRisk === 'CLEAN').length,
+        noResponse: analyzed.filter(r => !r.response).length,
+      },
+      reviewCount: reviews.length,
+      reviews: analyzed,
+      timestamp: new Date().toISOString(),
+      disclaimer: 'This analysis is for informational purposes only and does not constitute legal advice. Consult a HIPAA compliance attorney for formal guidance.',
+    });
+  } catch (err) {
+    console.error('[scan-reviews] error:', err.message);
+    res.status(500).json({ error: 'Scan failed', message: err.message });
+  }
+});
+
+app.post('/analyze-response', (req, res) => {
+  const { responseText, rating } = req.body;
+  if (!responseText) return res.status(400).json({ error: 'responseText is required' });
+  const analysis = analyzeHipaaResponse(responseText);
+  res.json({ success: true, ...analysis, safeResponse: generateSafeResponse(rating || 3) });
+});
+
+// ─────────────────────────────────────────────
 // CACHE MANAGEMENT (optional admin endpoint)
 // ─────────────────────────────────────────────
 app.delete("/cache/clear", (req, res) => {
@@ -535,4 +675,4 @@ app.delete("/cache/clear", (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`ZYNAGI Scanner API v2.1 on port ${PORT}`));
+app.listen(PORT, () => console.log(`ZYNAGI Scanner API v2.2 on port ${PORT}`));

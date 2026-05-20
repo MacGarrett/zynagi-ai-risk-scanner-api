@@ -1,73 +1,90 @@
-const express = require("express");
-const cors = require("cors");
+const express     = require("express");
+const cors        = require("cors");
 const PDFDocument = require("pdfkit");
-const cron = require("node-cron");
+const cron        = require("node-cron");
 
-const app = express();
+const app     = express();
+const VERSION = "2.3";
 
-app.use(cors());
-app.use(express.json());
+// ─────────────────────────────────────────────
+// CORS
+// Allow: zynagi.com, base44.com subdomains, railway.app previews, localhost
+// Set CORS_ALLOW_ALL=true in Railway env to open fully during development.
+// ─────────────────────────────────────────────
+const ALLOWED_ORIGINS = [
+  "https://zynagi.com",
+  "https://www.zynagi.com",
+  "https://app.base44.com",
+];
+
+app.use(
+  cors({
+    origin(origin, cb) {
+      if (!origin) return cb(null, true); // curl / Postman / server-to-server
+      const ok =
+        !origin ||
+        ALLOWED_ORIGINS.includes(origin) ||
+        /\.base44\.com$/.test(origin) ||
+        /\.railway\.app$/.test(origin) ||
+        /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin) ||
+        process.env.CORS_ALLOW_ALL === "true";
+      cb(null, ok);
+    },
+    methods:        ["GET", "POST", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "x-admin-key"],
+    credentials:    true,
+  })
+);
+
+app.use(express.json({ limit: "1mb" }));
 
 // ─────────────────────────────────────────────
 // IN-MEMORY STORES
 // ─────────────────────────────────────────────
-
-// Monitored URLs for recurring scans
 const monitoredUrls = new Map();
+const scanCache     = new Map();
+const CACHE_TTL_MS  = 12 * 60 * 60 * 1000; // 12 h
 
-// Result cache: url → { result, cachedAt }
-const scanCache = new Map();
-const CACHE_TTL_MS = 12 * 60 * 60 * 1000; // 12 hours
+const rateLimitMap   = new Map();
+const RATE_LIMIT_MAX = 5;
+const RATE_LIMIT_MS  = 60 * 60 * 1000; // 1 h
 
-// Rate limiting: ip → { count, resetAt }
-const rateLimitMap = new Map();
-const RATE_LIMIT_MAX = 5;               // max scans per window per IP
-const RATE_LIMIT_MS  = 60 * 60 * 1000; // 1-hour window
-
-// Track whether PageSpeed is currently in fallback mode
 let pagespeedFallbackMode = false;
 
 // ─────────────────────────────────────────────
-// HELPERS
+// GENERIC HELPERS
 // ─────────────────────────────────────────────
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-function isQuotaError(message = "") {
+function isQuotaError(msg = "") {
   return (
-    message.includes("Quota exceeded") ||
-    message.includes("quota") ||
-    message.includes("RESOURCE_EXHAUSTED") ||
-    message.includes("rateLimitExceeded")
+    msg.includes("Quota exceeded") ||
+    msg.includes("quota") ||
+    msg.includes("RESOURCE_EXHAUSTED") ||
+    msg.includes("rateLimitExceeded")
   );
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-// Fetch PageSpeed with retry/backoff (skips retry on quota errors)
 async function fetchPageSpeed(psiUrl, retries = 2, delayMs = 2000) {
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      const response = await fetch(psiUrl, { signal: AbortSignal.timeout(35000) });
-      const data = await response.json();
-
+      const resp = await fetch(psiUrl, { signal: AbortSignal.timeout(35000) });
+      const data = await resp.json();
       if (data.error) {
         const msg = data.error.message || "";
         if (isQuotaError(msg)) {
-          // Don't retry quota errors — throw immediately
-          const err = new Error(msg);
-          err.isQuota = true;
-          throw err;
+          const e = new Error(msg);
+          e.isQuota = true;
+          throw e;
         }
         throw new Error(msg);
       }
-
       return data;
     } catch (err) {
-      if (err.isQuota) throw err; // quota — give up immediately
+      if (err.isQuota) throw err;
       if (attempt < retries) {
-        console.warn(`[PageSpeed] Attempt ${attempt + 1} failed, retrying in ${delayMs * (attempt + 1)}ms:`, err.message);
-        await sleep(delayMs * (attempt + 1)); // exponential backoff
+        console.warn(`[PageSpeed] Attempt ${attempt + 1} failed (${err.message}), retrying…`);
+        await sleep(delayMs * (attempt + 1));
       } else {
         throw err;
       }
@@ -75,102 +92,85 @@ async function fetchPageSpeed(psiUrl, retries = 2, delayMs = 2000) {
   }
 }
 
-// Build a safe fallback response when PageSpeed is unavailable
 function buildFallbackResponse(url) {
   return {
-    success: true,
-    scanStatus: "partial",
-    message:
-      "Scan completed with limited performance data. Core trust checks are still available. " +
-      "Full Lighthouse data will be available once the API quota resets.",
-    scannedUrl: url,
-    timestamp: new Date().toISOString(),
+    success:          true,
+    scanStatus:       "partial",
+    message:          "Scan completed with limited data. Full Lighthouse data available once API quota resets.",
+    scannedUrl:       url,
+    timestamp:        new Date().toISOString(),
     overallRiskScore: 50,
-    scores: {
-      performance:   null,
-      accessibility: null,
-      bestPractices: null,
-      seo:           null,
-    },
-    coreWebVitals: { lcp: "N/A", tbt: "N/A", cls: "N/A" },
-    adaFindings: [],
+    scores:           { performance: null, accessibility: null, bestPractices: null, seo: null },
+    coreWebVitals:    { lcp: "N/A", tbt: "N/A", cls: "N/A" },
+    adaFindings:      [],
     findings: [
-      "Performance data temporarily unavailable — API quota exceeded. Try again in a few hours.",
-      "ADA compliance data temporarily unavailable — API quota exceeded.",
+      "Performance data temporarily unavailable — API quota exceeded. Retry in a few hours.",
+      "ADA compliance data temporarily unavailable.",
       "Manual accessibility review recommended until data is available.",
     ],
-    recommendation:
-      "PARTIAL DATA — Retry scan later for a full Lighthouse risk assessment.",
+    recommendation: "PARTIAL DATA — Retry scan later for a full Lighthouse risk assessment.",
   };
 }
 
-// Check and update rate limit for an IP. Returns true if allowed.
 function checkRateLimit(ip) {
-  const now = Date.now();
+  const now   = Date.now();
   const entry = rateLimitMap.get(ip);
-
   if (!entry || now > entry.resetAt) {
     rateLimitMap.set(ip, { count: 1, resetAt: now + RATE_LIMIT_MS });
     return true;
   }
-
   if (entry.count >= RATE_LIMIT_MAX) return false;
-
-  entry.count += 1;
+  entry.count++;
   return true;
 }
 
 // ─────────────────────────────────────────────
-// HEALTH CHECK
+// HEALTH — GET / and GET /health both work
 // ─────────────────────────────────────────────
-app.get("/health", (req, res) => {
-  res.json({
-    status: "ok",
-    version: "2.2",
+function healthPayload() {
+  return {
+    status:               "ok",
+    version:              VERSION,
     pagespeedFallbackMode,
-    cacheSize: scanCache.size,
-    monitoredCount: monitoredUrls.size,
-    rateLimitPolicy: `${RATE_LIMIT_MAX} scans / hour per IP`,
-    cacheTTL: "12 hours",
-  });
-});
+    cacheSize:            scanCache.size,
+    monitoredCount:       monitoredUrls.size,
+    rateLimitPolicy:      `${RATE_LIMIT_MAX} scans / hour per IP`,
+    cacheTTL:             "12 hours",
+  };
+}
+
+app.get("/",       (_req, res) => res.json(healthPayload()));
+app.get("/health", (_req, res) => res.json(healthPayload()));
 
 // ─────────────────────────────────────────────
-// FULL SCAN — Lighthouse + ADA via PageSpeed Insights
+// WEBSITE SCAN — Lighthouse + ADA via PageSpeed Insights
 // ─────────────────────────────────────────────
 app.post("/scan", async (req, res) => {
   const { url } = req.body;
   if (!url) return res.status(400).json({ error: "URL is required" });
 
-  // ── Rate limiting ──
   const ip =
     req.headers["x-forwarded-for"]?.split(",")[0]?.trim() ||
     req.socket.remoteAddress ||
     "unknown";
   if (!checkRateLimit(ip)) {
     return res.status(429).json({
-      error: "Too many scans",
+      error:   "Too many scans",
       message: `You can run up to ${RATE_LIMIT_MAX} scans per hour. Please wait and try again.`,
     });
   }
 
-  // ── Cache check ──
   const cacheKey = url.toLowerCase().trim();
-  const cached = scanCache.get(cacheKey);
+  const cached   = scanCache.get(cacheKey);
   if (cached && Date.now() - cached.cachedAt < CACHE_TTL_MS) {
     console.log(`[Cache] HIT for ${url}`);
-    return res.json({
-      ...cached.result,
-      fromCache: true,
-      cachedAt: new Date(cached.cachedAt).toISOString(),
-    });
+    return res.json({ ...cached.result, fromCache: true, cachedAt: new Date(cached.cachedAt).toISOString() });
   }
 
   try {
-    const apiKey = process.env.PAGESPEED_API_KEY || "";
-    const categories =
-      "category=performance&category=accessibility&category=best-practices&category=seo";
-    const psiUrl = `https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=${encodeURIComponent(url)}&strategy=desktop&${categories}${apiKey ? "&key=" + apiKey : ""}`;
+    const apiKey    = process.env.PAGESPEED_API_KEY || "";
+    const categories = "category=performance&category=accessibility&category=best-practices&category=seo";
+    const psiUrl    = `https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=${encodeURIComponent(url)}&strategy=desktop&${categories}${apiKey ? "&key=" + apiKey : ""}`;
 
     let data;
     try {
@@ -179,13 +179,8 @@ app.post("/scan", async (req, res) => {
     } catch (psiErr) {
       console.warn("[PageSpeed] API unavailable:", psiErr.message);
       pagespeedFallbackMode = true;
-
       const fallback = buildFallbackResponse(url);
-      // Cache fallback briefly (30 min) so the same URL doesn't hammer a dead API
-      scanCache.set(cacheKey, {
-        result: fallback,
-        cachedAt: Date.now() - (CACHE_TTL_MS - 30 * 60 * 1000),
-      });
+      scanCache.set(cacheKey, { result: fallback, cachedAt: Date.now() - (CACHE_TTL_MS - 30 * 60 * 1000) });
       return res.json(fallback);
     }
 
@@ -200,7 +195,6 @@ app.post("/scan", async (req, res) => {
     const avgScore  = (perf + access + bp + seo) / 4;
     const riskScore = Math.round(100 - avgScore);
 
-    // ADA-specific audit checks
     const adaAuditIds = [
       "color-contrast", "image-alt", "label", "link-name", "button-name",
       "document-title", "html-has-lang", "aria-required-attr", "aria-valid-attr",
@@ -208,17 +202,16 @@ app.post("/scan", async (req, res) => {
       "landmark-one-main", "region",
     ];
     const adaFindings = adaAuditIds
-      .map((id) => audits[id])
-      .filter((a) => a && a.score !== null && a.score < 1)
-      .map((a) => ({
-        id: a.id,
-        title: a.title,
+      .map(id => audits[id])
+      .filter(a => a && a.score !== null && a.score < 1)
+      .map(a => ({
+        id:        a.id,
+        title:     a.title,
         description: a.description,
-        score: Math.round((a.score || 0) * 100),
+        score:     Math.round((a.score || 0) * 100),
         itemCount: a.details?.items?.length || 0,
       }));
 
-    // Human-readable risk findings
     const findings = [];
     if (perf   < 70) findings.push(`Performance risk (${perf}/100): Slow load times increase bounce rate and reduce conversion`);
     if (access < 90) findings.push(`ADA compliance risk (${access}/100): ${adaFindings.length} accessibility violations detected — potential legal exposure`);
@@ -236,32 +229,29 @@ app.post("/scan", async (req, res) => {
                        "LOW RISK — Monitor quarterly";
 
     const result = {
-      success: true,
-      scanStatus: "full",
-      scannedUrl: url,
-      timestamp: new Date().toISOString(),
+      success:          true,
+      scanStatus:       "full",
+      scannedUrl:       url,
+      timestamp:        new Date().toISOString(),
       overallRiskScore: riskScore,
-      scores: { performance: perf, accessibility: access, bestPractices: bp, seo },
-      coreWebVitals: { lcp, tbt, cls },
+      scores:           { performance: perf, accessibility: access, bestPractices: bp, seo },
+      coreWebVitals:    { lcp, tbt, cls },
       adaFindings,
       findings,
       recommendation,
     };
 
-    // Cache full result for 12 hours
     scanCache.set(cacheKey, { result, cachedAt: Date.now() });
     console.log(`[Cache] STORED for ${url}`);
-
     res.json(result);
   } catch (err) {
     console.error("Scan error:", err.message);
-    // Last-resort fallback — never expose raw errors to visitors
     res.json(buildFallbackResponse(url));
   }
 });
 
 // ─────────────────────────────────────────────
-// PDF REPORT GENERATION
+// PDF REPORT
 // ─────────────────────────────────────────────
 app.post("/report/pdf", async (req, res) => {
   const { scanData } = req.body;
@@ -270,104 +260,61 @@ app.post("/report/pdf", async (req, res) => {
   try {
     const doc = new PDFDocument({ margin: 50, size: "A4" });
     res.setHeader("Content-Type", "application/pdf");
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename="zynagi-risk-report-${Date.now()}.pdf"`
-    );
+    res.setHeader("Content-Disposition", `attachment; filename="zynagi-risk-report-${Date.now()}.pdf"`);
     doc.pipe(res);
 
-    const BLACK = "#000000";
-    const GRAY  = "#666666";
-    const LGRAY = "#aaaaaa";
-    const RED   = "#cc2200";
-    const AMBER = "#ff8800";
-    const GREEN = "#009944";
-    const BLUE  = "#0055cc";
+    const BLACK = "#000000", GRAY = "#666666", LGRAY = "#aaaaaa";
+    const RED   = "#cc2200", AMBER = "#ff8800", GREEN = "#009944", BLUE = "#0055cc";
 
-    const riskScore = scanData.overallRiskScore ?? 50;
-    const riskColor = riskScore > 60 ? RED : riskScore > 30 ? AMBER : GREEN;
-    const scoreColor = (s) =>
-      s == null ? GRAY : s >= 90 ? GREEN : s >= 70 ? AMBER : RED;
+    const riskScore  = scanData.overallRiskScore ?? 50;
+    const riskColor  = riskScore > 60 ? RED : riskScore > 30 ? AMBER : GREEN;
+    const scoreColor = s => s == null ? GRAY : s >= 90 ? GREEN : s >= 70 ? AMBER : RED;
 
-    // Header bar
     doc.rect(0, 0, 595, 80).fill("#0a0a0a");
     doc.fontSize(26).font("Helvetica-Bold").fillColor("#ffffff").text("ZYNAGI", 50, 22);
     doc.fontSize(10).font("Helvetica").fillColor("#888888").text("AI RISK INTELLIGENCE REPORT", 50, 55);
     doc.fillColor("#ffffff").fontSize(9).text("CONFIDENTIAL", 460, 36);
 
-    // Partial scan banner
     let yBase = 100;
     if (scanData.scanStatus === "partial") {
       doc.rect(0, 80, 595, 22).fill("#3a1a00");
-      doc
-        .fontSize(8)
-        .font("Helvetica")
-        .fillColor("#ffaa44")
-        .text(
-          "PARTIAL SCAN — PageSpeed data unavailable. Retry for a full report.",
-          50, 87
-        );
+      doc.fontSize(8).font("Helvetica").fillColor("#ffaa44")
+         .text("PARTIAL SCAN — PageSpeed data unavailable. Retry for a full report.", 50, 87);
       yBase = 112;
     }
 
-    // URL + timestamp
     doc.fillColor(BLACK).fontSize(11).font("Helvetica-Bold").text("Scanned URL:", 50, yBase);
-    doc
-      .fontSize(11)
-      .font("Helvetica")
-      .fillColor(BLUE)
-      .text(scanData.scannedUrl, 50, yBase + 16, { link: scanData.scannedUrl });
-    doc
-      .fillColor(GRAY)
-      .fontSize(9)
-      .text(
-        `Report generated: ${new Date(scanData.timestamp || Date.now()).toLocaleString("en-US", {
-          dateStyle: "long",
-          timeStyle: "short",
-        })}`,
-        50, yBase + 34
-      );
+    doc.fontSize(11).font("Helvetica").fillColor(BLUE)
+       .text(scanData.scannedUrl, 50, yBase + 16, { link: scanData.scannedUrl });
+    doc.fillColor(GRAY).fontSize(9)
+       .text(`Report generated: ${new Date(scanData.timestamp || Date.now()).toLocaleString("en-US", { dateStyle: "long", timeStyle: "short" })}`, 50, yBase + 34);
 
-    // Risk score
     let y = yBase + 58;
-    doc.moveTo(50, y).lineTo(545, y).lineWidth(0.5).stroke("#dddddd");
-    y += 13;
-    doc.fontSize(12).font("Helvetica-Bold").fillColor(BLACK).text("OVERALL RISK SCORE", 50, y);
-    y += 17;
+    doc.moveTo(50, y).lineTo(545, y).lineWidth(0.5).stroke("#dddddd"); y += 13;
+    doc.fontSize(12).font("Helvetica-Bold").fillColor(BLACK).text("OVERALL RISK SCORE", 50, y); y += 17;
     doc.fontSize(60).font("Helvetica-Bold").fillColor(riskColor).text(`${riskScore}`, 50, y);
     doc.fontSize(10).font("Helvetica").fillColor(GRAY).text(`/ 100  ·  ${scanData.recommendation}`, 130, y + 37);
 
-    // Category scores
     y += 70;
-    doc.moveTo(50, y).lineTo(545, y).lineWidth(0.5).stroke("#dddddd");
-    y += 13;
-    doc.fontSize(12).font("Helvetica-Bold").fillColor(BLACK).text("CATEGORY SCORES", 50, y);
-    y += 24;
+    doc.moveTo(50, y).lineTo(545, y).lineWidth(0.5).stroke("#dddddd"); y += 13;
+    doc.fontSize(12).font("Helvetica-Bold").fillColor(BLACK).text("CATEGORY SCORES", 50, y); y += 24;
 
-    const scoreRows = [
+    [
       ["Performance",         scanData.scores?.performance],
       ["Accessibility (ADA)", scanData.scores?.accessibility],
       ["Best Practices",      scanData.scores?.bestPractices],
       ["SEO",                 scanData.scores?.seo],
-    ];
-
-    scoreRows.forEach(([label, score]) => {
+    ].forEach(([label, score]) => {
       doc.fontSize(11).font("Helvetica").fillColor(BLACK).text(label, 50, y);
       doc.rect(250, y + 2, 200, 10).fill("#eeeeee");
       if (score != null) doc.rect(250, y + 2, Math.round(score * 2), 10).fill(scoreColor(score));
-      doc
-        .fontSize(11)
-        .font("Helvetica-Bold")
-        .fillColor(scoreColor(score))
-        .text(score != null ? `${score}/100` : "N/A", 462, y);
+      doc.fontSize(11).font("Helvetica-Bold").fillColor(scoreColor(score))
+         .text(score != null ? `${score}/100` : "N/A", 462, y);
       y += 26;
     });
 
-    // Core Web Vitals
-    doc.moveTo(50, y + 6).lineTo(545, y + 6).lineWidth(0.5).stroke("#dddddd");
-    y += 20;
-    doc.fontSize(12).font("Helvetica-Bold").fillColor(BLACK).text("CORE WEB VITALS", 50, y);
-    y += 22;
+    doc.moveTo(50, y + 6).lineTo(545, y + 6).lineWidth(0.5).stroke("#dddddd"); y += 20;
+    doc.fontSize(12).font("Helvetica-Bold").fillColor(BLACK).text("CORE WEB VITALS", 50, y); y += 22;
     [
       ["Largest Contentful Paint (LCP)", scanData.coreWebVitals?.lcp],
       ["Total Blocking Time (TBT)",      scanData.coreWebVitals?.tbt],
@@ -378,39 +325,28 @@ app.post("/report/pdf", async (req, res) => {
       y += 18;
     });
 
-    // Risk findings
-    doc.moveTo(50, y + 8).lineTo(545, y + 8).lineWidth(0.5).stroke("#dddddd");
-    y += 22;
-    doc.fontSize(12).font("Helvetica-Bold").fillColor(BLACK).text("RISK FINDINGS", 50, y);
-    y += 20;
-    (scanData.findings || []).forEach((finding) => {
+    doc.moveTo(50, y + 8).lineTo(545, y + 8).lineWidth(0.5).stroke("#dddddd"); y += 22;
+    doc.fontSize(12).font("Helvetica-Bold").fillColor(BLACK).text("RISK FINDINGS", 50, y); y += 20;
+    (scanData.findings || []).forEach(finding => {
       if (y > 720) { doc.addPage(); y = 50; }
       doc.fontSize(10).font("Helvetica").fillColor("#333333").text(`• ${finding}`, 50, y, { width: 495 });
       y += doc.heightOfString(finding, { width: 495 }) + 8;
     });
 
-    // ADA violations
     if (scanData.adaFindings?.length > 0) {
       if (y > 650) { doc.addPage(); y = 50; }
-      doc.moveTo(50, y + 8).lineTo(545, y + 8).lineWidth(0.5).stroke("#dddddd");
-      y += 22;
-      doc.fontSize(12).font("Helvetica-Bold").fillColor(BLACK).text("ADA ACCESSIBILITY VIOLATIONS", 50, y);
-      y += 20;
-      scanData.adaFindings.slice(0, 10).forEach((issue) => {
+      doc.moveTo(50, y + 8).lineTo(545, y + 8).lineWidth(0.5).stroke("#dddddd"); y += 22;
+      doc.fontSize(12).font("Helvetica-Bold").fillColor(BLACK).text("ADA ACCESSIBILITY VIOLATIONS", 50, y); y += 20;
+      scanData.adaFindings.slice(0, 10).forEach(issue => {
         if (y > 710) { doc.addPage(); y = 50; }
-        doc.fontSize(10).font("Helvetica-Bold").fillColor(RED).text(`x  ${issue.title}`, 50, y);
-        y += 16;
+        doc.fontSize(10).font("Helvetica-Bold").fillColor(RED).text(`x  ${issue.title}`, 50, y); y += 16;
         doc.fontSize(9).font("Helvetica").fillColor(GRAY).text(issue.description, 65, y, { width: 480 });
         y += doc.heightOfString(issue.description, { width: 480 }) + 12;
       });
     }
 
-    // Footer
-    doc.fontSize(8).fillColor(LGRAY).text(
-      "ZYNAGI AI Risk Intelligence  |  zynagi.com  |  Confidential — Not for distribution",
-      50, 810, { align: "center", width: 495 }
-    );
-
+    doc.fontSize(8).fillColor(LGRAY)
+       .text("ZYNAGI AI Risk Intelligence  |  zynagi.com  |  Confidential — Not for distribution", 50, 810, { align: "center", width: 495 });
     doc.end();
   } catch (err) {
     console.error("PDF error:", err.message);
@@ -422,9 +358,7 @@ app.post("/report/pdf", async (req, res) => {
 // STRIPE SUBSCRIPTIONS
 // ─────────────────────────────────────────────
 app.post("/stripe/checkout", async (req, res) => {
-  if (!process.env.STRIPE_SECRET_KEY) {
-    return res.status(503).json({ error: "Stripe not configured" });
-  }
+  if (!process.env.STRIPE_SECRET_KEY) return res.status(503).json({ error: "Stripe not configured" });
   const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
   const { plan, email } = req.body;
 
@@ -434,18 +368,16 @@ app.post("/stripe/checkout", async (req, res) => {
     enterprise: { price: process.env.STRIPE_PRICE_ENTERPRISE },
   };
 
-  if (!plans[plan]?.price) {
-    return res.status(400).json({ error: "Invalid plan or price not configured" });
-  }
+  if (!plans[plan]?.price) return res.status(400).json({ error: "Invalid plan or price not configured" });
 
   try {
     const session = await stripe.checkout.sessions.create({
-      mode: "subscription",
+      mode:                "subscription",
       payment_method_types: ["card"],
-      customer_email: email,
-      line_items: [{ price: plans[plan].price, quantity: 1 }],
-      success_url: `https://zynagi.com/success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url:  `https://zynagi.com/ai-risk-assessment`,
+      customer_email:      email,
+      line_items:          [{ price: plans[plan].price, quantity: 1 }],
+      success_url:         `https://zynagi.com/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url:          `https://zynagi.com/ai-risk-assessment`,
     });
     res.json({ url: session.url });
   } catch (err) {
@@ -474,45 +406,30 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), (req, res
 app.post("/monitor/add", (req, res) => {
   const { url, email, frequency } = req.body;
   if (!url || !email) return res.status(400).json({ error: "URL and email required" });
-  monitoredUrls.set(url, {
-    email,
-    frequency: frequency || "weekly",
-    addedAt: new Date().toISOString(),
-    lastScanned: null,
-    lastScore: null,
-  });
+  monitoredUrls.set(url, { email, frequency: frequency || "weekly", addedAt: new Date().toISOString(), lastScanned: null, lastScore: null });
   res.json({ success: true, message: `${url} is now being monitored ${frequency || "weekly"}` });
 });
 
 app.delete("/monitor/remove", (req, res) => {
-  const { url } = req.body;
-  monitoredUrls.delete(url);
+  monitoredUrls.delete(req.body.url);
   res.json({ success: true });
 });
 
-app.get("/monitor/list", (req, res) => {
-  const list = Array.from(monitoredUrls.entries()).map(([url, data]) => ({ url, ...data }));
-  res.json({ monitored: list });
+app.get("/monitor/list", (_req, res) => {
+  res.json({ monitored: Array.from(monitoredUrls.entries()).map(([url, data]) => ({ url, ...data })) });
 });
 
-// Cron: run at 8am UTC daily
 cron.schedule("0 8 * * *", async () => {
   console.log(`[Cron] Monitoring scans — ${new Date().toISOString()}`);
   const isMonday = new Date().getDay() === 1;
-
   for (const [url, data] of monitoredUrls.entries()) {
     if (data.frequency === "daily" || (data.frequency === "weekly" && isMonday)) {
       try {
         const psiUrl = `https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=${encodeURIComponent(url)}&strategy=desktop&category=accessibility&category=performance${process.env.PAGESPEED_API_KEY ? "&key=" + process.env.PAGESPEED_API_KEY : ""}`;
-        const d = await fetchPageSpeed(psiUrl);
+        const d   = await fetchPageSpeed(psiUrl);
         const acc = Math.round((d.lighthouseResult?.categories?.accessibility?.score || 0) * 100);
         const prf = Math.round((d.lighthouseResult?.categories?.performance?.score  || 0) * 100);
-        monitoredUrls.set(url, {
-          ...data,
-          lastScanned: new Date().toISOString(),
-          lastScore: { accessibility: acc, performance: prf },
-        });
-        // Invalidate cache so next manual scan gets fresh data
+        monitoredUrls.set(url, { ...data, lastScanned: new Date().toISOString(), lastScore: { accessibility: acc, performance: prf } });
         scanCache.delete(url.toLowerCase().trim());
         console.log(`[Cron] ${url} -> ADA: ${acc}, Perf: ${prf}`);
       } catch (e) {
@@ -526,100 +443,268 @@ cron.schedule("0 8 * * *", async () => {
 // HIPAA REVIEW SCANNER
 // ─────────────────────────────────────────────
 
+// HIGH — directly confirms PHI, patient status, or specific treatment
 const HIPAA_HIGH = [
-  { r: /\b(as your|you are|you were)\s+(our\s+)?(patient|client)\b/gi, v: 'Directly confirms patient/client relationship' },
-  { r: /\bour\s+(patient|client)\b/gi, v: 'Directly confirms patient status' },
-  { r: /\byour\s+(treatment|procedure|appointment|surgery|diagnosis|prescription|medication)\b/gi, v: 'References patient medical information' },
-  { r: /\byour\s+(insurance|coverage|co-pay|copay|bill|payment|balance|claim)\b/gi, v: 'References patient financial/insurance info (PHI)' },
-  { r: /\bour\s+(records|chart|file)\s+(show|indicate)\b/gi, v: 'Implies access to patient records' },
-  { r: /\b(root canal|crown|filling|extraction|surgery|chemotherapy|dialysis|implant|biopsy)\b/gi, v: 'Mentions specific medical/dental procedure' },
-  { r: /\bwhen you (came in|visited us|were here|had your)\b/gi, v: 'References specific patient visit' },
-  { r: /\byour (condition|diagnosis|symptoms|illness|treatment plan)\b/gi, v: 'References patient medical condition (PHI)' },
+  // Patient/client relationship
+  { r: /\b(as your|you are|you were|you're)\s+(our\s+)?(patient|client)\b/gi,
+    v: "Directly confirms reviewer is a patient/client (PHI)" },
+  { r: /\bour\s+(patient|client)\b/gi,
+    v: "Directly confirms patient status" },
+
+  // Named treatments, procedures, devices
+  { r: /\byour\s+(treatment|procedure|surgery|operation|therapy|injection|prescription|medication|diagnosis)\b/gi,
+    v: "References specific patient medical information (PHI)" },
+  { r: /\byour\s+(Invisalign|braces|aligners|implant|implants|extraction|cleaning|whitening|filling|fillings|root canal|crown|crowns|veneer|veneers|denture|dentures|sleep apnea treatment|CPAP|retainer|sealant|night guard)\b/gi,
+    v: "References specific dental treatment or device by name (PHI)" },
+  { r: /\b(root canal|Invisalign|sleep apnea|chemotherapy|dialysis|biopsy|radiation therapy|colonoscopy|CPAP therapy)\b/gi,
+    v: "Mentions specific medical/dental procedure by name — may confirm patient relationship" },
+
+  // Appointment / visit specifics
+  { r: /\byour\s+(appointment|visit|consultation|follow-?up|check-?up)\b/gi,
+    v: "References specific patient appointment or visit (PHI)" },
+  { r: /\bwhen you (came in|visited us|were here|had your|came for|scheduled)\b/gi,
+    v: "References specific patient visit" },
+
+  // Medical condition / test results
+  { r: /\byour\s+(condition|diagnosis|symptoms|illness|prognosis|test results?|lab results?|x-?ray|scan results?)\b/gi,
+    v: "References patient medical condition or test results (PHI)" },
+  { r: /\bour\s+(records|chart|file|notes)\s+(show|indicate|reflect|confirm)\b/gi,
+    v: "Implies access to patient medical records" },
+
+  // Financial / insurance tied to care
+  { r: /\byour\s+(insurance|coverage|co-?pay|copay|bill|balance|claim|deductible|out-of-pocket)\b/gi,
+    v: "References patient financial or insurance information (PHI)" },
+
+  // Care / treatment plan
+  { r: /\byour\s+(care plan|treatment plan|wellness plan|recovery plan|dental plan)\b/gi,
+    v: "References specific patient care or treatment plan (PHI)" },
 ];
 
+// MEDIUM — implies patient relationship without explicit PHI
 const HIPAA_MEDIUM = [
-  { r: /\byour (specific |)(concerns|issues|complaints)\b/gi, v: 'Implies specific knowledge of patient concerns' },
-  { r: /\bas we (discussed|mentioned|spoke about)\b/gi, v: 'References prior private communication' },
-  { r: /\byour experience with (us|our office|our practice)\b/gi, v: 'May imply confirmed patient relationship' },
-  { r: /\bwe understand your (frustration|concern|situation)\b/gi, v: 'Implies specific knowledge of patient situation' },
-  { r: /\bwe (see|note|noticed) that\b/gi, v: 'May imply access to patient records' },
+  { r: /\byour (specific |)(concerns|issues|complaints|problem)\b/gi,
+    v: "Implies specific knowledge of patient concerns" },
+  { r: /\bas we (discussed|mentioned|spoke about|talked about)\b/gi,
+    v: "References prior private communication" },
+  { r: /\byour experience with (us|our office|our practice|our team|our clinic)\b/gi,
+    v: "May imply confirmed patient relationship" },
+  { r: /\bwe understand your (frustration|concern|situation|needs|discomfort)\b/gi,
+    v: "Implies specific knowledge of patient situation" },
+  { r: /\bwe (see|note|noticed|can see|observe) that\b/gi,
+    v: "May imply access to patient records" },
+  { r: /\byour (care|dental health|oral health|health journey|smile journey|wellness journey)\b/gi,
+    v: "References patient's healthcare context (may confirm relationship)" },
+  { r: /\bseeing you (again|back|soon) for (care|treatment|your next)\b/gi,
+    v: "Implies ongoing patient relationship and future treatment" },
+  { r: /\byour (next|upcoming|scheduled) (care|treatment|checkup|check-?up|cleaning)\b/gi,
+    v: "References future care — implies confirmed patient relationship" },
 ];
 
+// LOW — mild, generic healthcare language that may hint at a care relationship
+const HIPAA_LOW = [
+  { r: /\byour (smile|comfort|recovery|healing|well-?being)\b/gi,
+    v: "Generic healthcare language that may imply a care context" },
+  { r: /\bhope (you feel|you are feeling|you're feeling) (better|well|great)\b/gi,
+    v: "Implies health/medical context" },
+  { r: /\bour (team|staff|doctors?|hygienists?|nurses?|providers?) (cares?|looks?) (about|after) you\b/gi,
+    v: "Implies ongoing care relationship" },
+];
+
+// ─────────────────────────────────────────────
+// HIPAA ANALYSIS ENGINE
+// ─────────────────────────────────────────────
 function analyzeHipaaResponse(responseText) {
-  if (!responseText || !responseText.trim()) return { risk: 'NO_RESPONSE', violations: [], score: 0 };
+  if (!responseText || !responseText.trim()) {
+    return { risk: "NO_RESPONSE", violations: [], score: 0 };
+  }
+
   const violations = [];
   let score = 0;
+
   for (const p of HIPAA_HIGH) {
-    if (p.r.test(responseText)) { violations.push({ severity: 'HIGH', message: p.v }); score += 30; }
+    if (p.r.test(responseText)) { violations.push({ severity: "HIGH",   message: p.v }); score += 30; }
     p.r.lastIndex = 0;
   }
   for (const p of HIPAA_MEDIUM) {
-    if (p.r.test(responseText)) { violations.push({ severity: 'MEDIUM', message: p.v }); score += 12; }
+    if (p.r.test(responseText)) { violations.push({ severity: "MEDIUM", message: p.v }); score += 12; }
     p.r.lastIndex = 0;
   }
+  for (const p of HIPAA_LOW) {
+    if (p.r.test(responseText)) { violations.push({ severity: "LOW",    message: p.v }); score +=  5; }
+    p.r.lastIndex = 0;
+  }
+
   score = Math.min(100, score);
-  const risk = violations.some(v => v.severity === 'HIGH') ? 'HIGH'
-    : violations.some(v => v.severity === 'MEDIUM') ? 'MEDIUM'
-    : score > 0 ? 'LOW' : 'CLEAN';
+
+  const risk =
+    violations.some(v => v.severity === "HIGH")   ? "HIGH"   :
+    violations.some(v => v.severity === "MEDIUM")  ? "MEDIUM" :
+    violations.some(v => v.severity === "LOW")     ? "LOW"    :
+    "CLEAN";
+
   return { risk, violations, score };
 }
 
+// HIPAA-safe response templates — never confirm patient status or mention treatment
 function generateSafeResponse(rating) {
-  if (rating >= 4) return 'Thank you so much for taking the time to share your experience! We are committed to providing excellent care to our community and look forward to seeing you again!';
-  if (rating === 3) return 'Thank you for sharing your feedback. We strive to provide the best possible experience and appreciate you letting us know how we can improve. Please contact our office directly — we\'d love the opportunity to make things right.';
-  return 'We appreciate you taking the time to share your experience and are sorry to hear you were not fully satisfied. Please contact our office at your convenience so we can address your concerns.';
+  const r = Number(rating) || 3;
+  if (r >= 4) return "Thank you for your kind feedback. We appreciate you taking the time to share your experience with our team.";
+  if (r === 3) return "We appreciate your review and are grateful for your feedback. Our team values every opportunity to provide a positive experience. Please feel free to reach out to our office directly so we can learn more.";
+  return "Thank you for sharing your experience. We are sorry to hear your visit did not fully meet your expectations. Please contact our office at your convenience — we would appreciate the opportunity to address your feedback.";
 }
 
-function extractPlaceId(input) {
+// ─────────────────────────────────────────────
+// PLACE ID RESOLUTION
+// Handles: direct ChIJ IDs, full Maps URLs, shortened goo.gl/maps.app links
+// Falls back to Places Text Search if no Place ID found in URL
+// ─────────────────────────────────────────────
+async function resolveToPlaceId(input, apiKey) {
   if (!input) return null;
   input = input.trim();
-  if (/^ChIJ[a-zA-Z0-9_-]{20,}$/.test(input)) return input;
-  const m1 = input.match(/!1s(ChIJ[a-zA-Z0-9_-]+)!/); if (m1) return m1[1];
-  const m2 = input.match(/[?&]place_id=([a-zA-Z0-9_-]+)/); if (m2) return m2[1];
-  const m3 = input.match(/maps\/place\/[^/]+\/@[^/]+\/([0-9]+[a-z]\/[0-9]+[a-z]\/[^/!]+)/);
+
+  // Direct Place ID
+  if (/^ChIJ[a-zA-Z0-9_-]{10,}$/.test(input)) return input;
+
+  let urlToParse = input;
+
+  // Follow redirects for shortened links (goo.gl, maps.app.goo.gl)
+  if (/goo\.gl|maps\.app/.test(input)) {
+    try {
+      const r = await fetch(input, {
+        method: "HEAD", redirect: "follow",
+        signal: AbortSignal.timeout(6000),
+        headers: { "User-Agent": "Mozilla/5.0" },
+      });
+      urlToParse = r.url || input;
+    } catch (_) { /* use original URL */ }
+  }
+
+  // !1sChIJ...! embedded in URL data segment
+  const m1 = urlToParse.match(/!1s(ChIJ[a-zA-Z0-9_-]+)!/);
+  if (m1) return m1[1];
+
+  // ?place_id=... or &place_id=...
+  const m2 = urlToParse.match(/[?&]place_id=(ChIJ[a-zA-Z0-9_-]+)/);
+  if (m2) return m2[1];
+
+  // ?q=place_id:ChIJ...
+  const m3 = urlToParse.match(/q=place_id:(ChIJ[a-zA-Z0-9_-]+)/);
+  if (m3) return m3[1];
+
+  // CID format (?cid=NNNN) — resolve via Places Details
+  const cidMatch = urlToParse.match(/[?&]cid=(\d+)/);
+  if (cidMatch && apiKey) {
+    try {
+      const r = await fetch(
+        `https://maps.googleapis.com/maps/api/place/details/json?cid=${cidMatch[1]}&fields=place_id&key=${apiKey}`,
+        { signal: AbortSignal.timeout(8000) }
+      );
+      const d = await r.json();
+      if (d.result?.place_id) return d.result.place_id;
+    } catch (_) { /* fall through */ }
+  }
+
+  // Extract business name from URL path and use Places Text Search
+  if (apiKey) {
+    const pathMatch = urlToParse.match(/maps\/place\/([^/@?#]+)/);
+    if (pathMatch) {
+      const query = decodeURIComponent(pathMatch[1].replace(/\+/g, " "));
+      try {
+        const r = await fetch(
+          `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(query)}&key=${apiKey}`,
+          { signal: AbortSignal.timeout(10000) }
+        );
+        const d = await r.json();
+        if (d.results?.[0]?.place_id) return d.results[0].place_id;
+      } catch (_) { /* fall through */ }
+    }
+  }
+
   return null;
 }
 
-app.post('/scan-reviews', async (req, res) => {
+// ─────────────────────────────────────────────
+// POST /scan-reviews
+// ─────────────────────────────────────────────
+app.post("/scan-reviews", async (req, res) => {
   const { placeId, mapsUrl } = req.body;
-  const resolved = placeId || extractPlaceId(mapsUrl);
-  if (!resolved) {
-    return res.status(400).json({ error: 'Could not extract Place ID. Please paste the Place ID directly (starts with ChIJ...).' });
+  const rawInput = placeId || mapsUrl;
+
+  if (!rawInput) {
+    return res.status(400).json({
+      error: "Provide either placeId (e.g. ChIJ...) or mapsUrl (Google Maps link).",
+    });
   }
 
-  const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
-  if (!checkRateLimit(ip)) return res.status(429).json({ error: 'Too many scans. Please wait and try again.' });
+  const ip = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() ||
+             req.socket.remoteAddress || "unknown";
+  if (!checkRateLimit(ip)) {
+    return res.status(429).json({ error: "Too many scans. Please wait and try again." });
+  }
 
   const apiKey = process.env.GOOGLE_PLACES_API_KEY;
-  if (!apiKey) return res.status(503).json({ error: 'GOOGLE_PLACES_API_KEY not configured on the server.' });
+  if (!apiKey) {
+    return res.status(503).json({ error: "GOOGLE_PLACES_API_KEY is not configured on this server." });
+  }
+
+  // Resolve input to a Place ID
+  let resolved;
+  try {
+    resolved = await resolveToPlaceId(rawInput, apiKey);
+  } catch (err) {
+    console.error("[scan-reviews] resolveToPlaceId error:", err.message);
+    resolved = null;
+  }
+
+  if (!resolved) {
+    return res.status(400).json({
+      error:
+        "Could not extract a valid Place ID from the input. " +
+        "Paste the Place ID directly (starts with ChIJ...) or use a full Google Maps URL.",
+    });
+  }
 
   try {
-    const url = `https://maps.googleapis.com/maps/api/place/details/json?place_id=${encodeURIComponent(resolved)}&fields=name,rating,user_ratings_total,formatted_address,reviews&key=${apiKey}&reviews_sort=newest`;
-    const r = await fetch(url, { signal: AbortSignal.timeout(15000) });
+    const detailsUrl =
+      `https://maps.googleapis.com/maps/api/place/details/json` +
+      `?place_id=${encodeURIComponent(resolved)}` +
+      `&fields=name,rating,user_ratings_total,formatted_address,reviews` +
+      `&key=${apiKey}` +
+      `&reviews_sort=newest`;
+
+    const r    = await fetch(detailsUrl, { signal: AbortSignal.timeout(15000) });
     const data = await r.json();
 
-    if (data.status === 'NOT_FOUND' || data.status === 'INVALID_REQUEST') {
-      return res.status(400).json({ error: `Place not found. Check the Place ID or URL (API status: ${data.status}).` });
+    if (data.status === "NOT_FOUND" || data.status === "INVALID_REQUEST") {
+      return res.status(400).json({
+        error: `Place not found (Google API status: ${data.status}). Verify the Place ID or URL.`,
+      });
     }
-    if (data.status !== 'OK') {
-      return res.status(400).json({ error: `Google Places API error: ${data.status}` });
+    if (data.status !== "OK") {
+      return res.status(502).json({
+        error:  `Google Places API error: ${data.status}`,
+        detail: data.error_message || "",
+      });
     }
 
-    const place = data.result;
+    const place   = data.result;
     const reviews = place.reviews || [];
+
+    // Log business name only — never log review text or PHI
+    console.log(`[scan-reviews] OK place_id=${resolved} name="${place.name}" reviews=${reviews.length}`);
 
     const analyzed = reviews.map(rv => {
       const responseText = rv.author_reply?.text || null;
-      const analysis = analyzeHipaaResponse(responseText);
+      const analysis    = analyzeHipaaResponse(responseText);
       return {
-        author: rv.author_name,
-        rating: rv.rating,
-        reviewText: rv.text,
-        reviewTime: rv.relative_time_description,
-        response: responseText,
-        hipaaRisk: analysis.risk,
-        violations: analysis.violations,
-        riskScore: analysis.score,
+        author:       rv.author_name,
+        rating:       rv.rating,
+        reviewText:   rv.text,
+        reviewTime:   rv.relative_time_description,
+        response:     responseText,
+        hipaaRisk:    analysis.risk,
+        violations:   analysis.violations,
+        riskScore:    analysis.score,
         safeResponse: generateSafeResponse(rv.rating),
       };
     });
@@ -628,42 +713,95 @@ app.post('/scan-reviews', async (req, res) => {
     const avgScore = withResponses.length
       ? Math.round(withResponses.reduce((s, r) => s + r.riskScore, 0) / withResponses.length)
       : 0;
-    const overallRiskLevel = avgScore > 60 ? 'HIGH' : avgScore > 30 ? 'MEDIUM' : avgScore > 0 ? 'LOW' : 'CLEAN';
 
-    res.json({
-      success: true,
-      businessName: place.name,
-      businessRating: place.rating,
-      totalRatings: place.user_ratings_total,
-      address: place.formatted_address,
+    const overallRiskLevel =
+      avgScore > 60 ? "HIGH"   :
+      avgScore > 30 ? "MEDIUM" :
+      avgScore > 0  ? "LOW"    : "CLEAN";
+
+    return res.json({
+      success:          true,
+      businessName:     place.name,
+      businessRating:   place.rating,
+      totalRatings:     place.user_ratings_total,
+      address:          place.formatted_address,
       overallRiskScore: avgScore,
       overallRiskLevel,
       riskSummary: {
-        high: withResponses.filter(r => r.hipaaRisk === 'HIGH').length,
-        medium: withResponses.filter(r => r.hipaaRisk === 'MEDIUM').length,
-        clean: withResponses.filter(r => r.hipaaRisk === 'CLEAN').length,
+        high:       withResponses.filter(r => r.hipaaRisk === "HIGH").length,
+        medium:     withResponses.filter(r => r.hipaaRisk === "MEDIUM").length,
+        low:        withResponses.filter(r => r.hipaaRisk === "LOW").length,
+        clean:      withResponses.filter(r => r.hipaaRisk === "CLEAN").length,
         noResponse: analyzed.filter(r => !r.response).length,
       },
       reviewCount: reviews.length,
-      reviews: analyzed,
-      timestamp: new Date().toISOString(),
-      disclaimer: 'This analysis is for informational purposes only and does not constitute legal advice. Consult a HIPAA compliance attorney for formal guidance.',
+      reviews:     analyzed,
+      timestamp:   new Date().toISOString(),
+      disclaimer:
+        "This analysis is for informational purposes only and does not constitute legal advice. " +
+        "Consult a HIPAA compliance attorney for formal guidance.",
     });
   } catch (err) {
-    console.error('[scan-reviews] error:', err.message);
-    res.status(500).json({ error: 'Scan failed', message: err.message });
+    // Never log review content — only the error message
+    console.error("[scan-reviews] fetch error:", err.message);
+    return res.status(500).json({
+      error:  "Review scan failed. Please try again.",
+      detail: err.message,
+    });
   }
 });
 
-app.post('/analyze-response', (req, res) => {
+// ─────────────────────────────────────────────
+// POST /analyze-response
+// ─────────────────────────────────────────────
+app.post("/analyze-response", (req, res) => {
   const { responseText, rating } = req.body;
-  if (!responseText) return res.status(400).json({ error: 'responseText is required' });
+  if (!responseText || !responseText.trim()) {
+    return res.status(400).json({ error: "responseText is required and must not be empty." });
+  }
   const analysis = analyzeHipaaResponse(responseText);
-  res.json({ success: true, ...analysis, safeResponse: generateSafeResponse(rating || 3) });
+  return res.json({
+    success:      true,
+    risk:         analysis.risk,
+    violations:   analysis.violations,
+    score:        analysis.score,
+    safeResponse: generateSafeResponse(rating ?? 3),
+  });
 });
 
 // ─────────────────────────────────────────────
-// CACHE MANAGEMENT (optional admin endpoint)
+// TEST / SMOKE-TEST ROUTES (no Google API calls)
+// ─────────────────────────────────────────────
+app.get("/test/analyze-response", (_req, res) => {
+  const sample  = "Thank you for trusting us with your Invisalign treatment. As our patient, we appreciate your feedback.";
+  const result  = analyzeHipaaResponse(sample);
+  return res.json({
+    test:        "analyze-response",
+    input:       sample,
+    result,
+    safeResponse: generateSafeResponse(5),
+    status:      result.risk === "HIGH" ? "PASS ✓" : "UNEXPECTED — check patterns",
+  });
+});
+
+app.get("/test/scan-reviews", (_req, res) => {
+  const keyPresent = !!process.env.GOOGLE_PLACES_API_KEY;
+  return res.json({
+    test:          "scan-reviews",
+    apiKeyPresent: keyPresent,
+    status:        keyPresent
+      ? "CONFIG OK ✓ — POST /scan-reviews with a real placeId to test end-to-end"
+      : "MISSING KEY — set GOOGLE_PLACES_API_KEY in Railway environment variables",
+    exampleRequest: {
+      url:    "POST /scan-reviews",
+      body:   { placeId: "ChIJN1t_tDeuEmsRUsoyG83frY4" },
+      or:     { mapsUrl: "https://www.google.com/maps/place/Google+Sydney/@-33.8,151.1,15z/..." },
+    },
+  });
+});
+
+// ─────────────────────────────────────────────
+// CACHE MANAGEMENT
 // ─────────────────────────────────────────────
 app.delete("/cache/clear", (req, res) => {
   const adminKey = process.env.ADMIN_KEY;
@@ -674,5 +812,8 @@ app.delete("/cache/clear", (req, res) => {
   res.json({ success: true, message: "Scan cache cleared" });
 });
 
+// ─────────────────────────────────────────────
+// START
+// ─────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`ZYNAGI Scanner API v2.2 on port ${PORT}`));
+app.listen(PORT, () => console.log(`ZYNAGI Scanner API v${VERSION} on port ${PORT}`));

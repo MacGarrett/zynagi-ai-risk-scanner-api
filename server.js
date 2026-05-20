@@ -4,7 +4,7 @@ const PDFDocument = require("pdfkit");
 const cron        = require("node-cron");
 
 const app     = express();
-const VERSION = "2.3";
+const VERSION = "2.4";
 
 // ─────────────────────────────────────────────
 // CORS
@@ -136,6 +136,7 @@ function healthPayload() {
     monitoredCount:       monitoredUrls.size,
     rateLimitPolicy:      `${RATE_LIMIT_MAX} scans / hour per IP`,
     cacheTTL:             "12 hours",
+    serpApiEnabled:       !!process.env.SERPAPI_KEY,
   };
 }
 
@@ -624,11 +625,72 @@ async function resolveToPlaceId(input, apiKey) {
 }
 
 // ─────────────────────────────────────────────
+// SERPAPI PAGINATED REVIEW FETCHER
+// Fetches up to maxReviews reviews, paginating via next_page_token.
+// PHI-safe: never logs review text — only page counts and business name.
+// ─────────────────────────────────────────────
+async function fetchReviewsViaSerpApi(placeId, maxReviews, serpApiKey) {
+  const allReviews = [];
+  let nextPageToken = null;
+  let pageCount     = 0;
+  let placeInfo     = null;
+
+  do {
+    const params = new URLSearchParams({
+      engine:   "google_maps_reviews",
+      place_id: placeId,
+      sort_by:  "newest",
+      hl:       "en",
+      api_key:  serpApiKey,
+    });
+    if (nextPageToken) params.set("next_page_token", nextPageToken);
+
+    const r = await fetch(`https://serpapi.com/search?${params}`, {
+      signal: AbortSignal.timeout(20000),
+    });
+    const data = await r.json();
+
+    if (data.error) {
+      const e = new Error(`SerpAPI: ${data.error}`);
+      e.serpApiError = data.error;
+      throw e;
+    }
+
+    if (!placeInfo && data.place_info) {
+      placeInfo = data.place_info;
+    }
+
+    const pageReviews = data.reviews || [];
+    allReviews.push(...pageReviews);
+    pageCount++;
+
+    // PHI-safe logging — never log review content
+    console.log(`[serpapi] page=${pageCount} page_reviews=${pageReviews.length} total_so_far=${allReviews.length}`);
+
+    nextPageToken = data.serpapi_pagination?.next_page_token || null;
+
+    if (allReviews.length >= maxReviews) break;
+    if (!nextPageToken || pageReviews.length === 0) break;
+
+  } while (true);
+
+  return {
+    reviews:   allReviews.slice(0, maxReviews),
+    placeInfo: placeInfo || {},
+    pageCount,
+  };
+}
+
+// ─────────────────────────────────────────────
 // POST /scan-reviews
+// Accepts: { placeId, mapsUrl, maxReviews }
+// Uses SerpAPI (up to 1000 reviews) if SERPAPI_KEY env var is set.
+// Falls back to Google Places API (max 5 reviews) if not.
 // ─────────────────────────────────────────────
 app.post("/scan-reviews", async (req, res) => {
-  const { placeId, mapsUrl } = req.body;
-  const rawInput = placeId || mapsUrl;
+  const { placeId, mapsUrl, maxReviews: maxReviewsRaw } = req.body;
+  const rawInput   = placeId || mapsUrl;
+  const maxReviews = Math.max(1, Math.min(parseInt(maxReviewsRaw) || 100, 1000));
 
   if (!rawInput) {
     return res.status(400).json({
@@ -642,12 +704,14 @@ app.post("/scan-reviews", async (req, res) => {
     return res.status(429).json({ error: "Too many scans. Please wait and try again." });
   }
 
-  const apiKey = process.env.GOOGLE_PLACES_API_KEY;
+  const apiKey     = process.env.GOOGLE_PLACES_API_KEY;
+  const serpApiKey = process.env.SERPAPI_KEY;
+
   if (!apiKey) {
     return res.status(503).json({ error: "GOOGLE_PLACES_API_KEY is not configured on this server." });
   }
 
-  // Resolve input to a Place ID
+  // Resolve input to a canonical Place ID
   let resolved;
   try {
     resolved = await resolveToPlaceId(rawInput, apiKey);
@@ -664,44 +728,91 @@ app.post("/scan-reviews", async (req, res) => {
     });
   }
 
+  // Cache key includes maxReviews so different limits get separate entries
+  const cacheKey = `reviews:${resolved}:${maxReviews}`;
+  const cached   = scanCache.get(cacheKey);
+  if (cached && Date.now() - cached.cachedAt < CACHE_TTL_MS) {
+    console.log(`[Cache] HIT reviews place_id=${resolved} maxReviews=${maxReviews}`);
+    return res.json({ ...cached.result, fromCache: true, cachedAt: new Date(cached.cachedAt).toISOString() });
+  }
+
   try {
-    const detailsUrl =
-      `https://maps.googleapis.com/maps/api/place/details/json` +
-      `?place_id=${encodeURIComponent(resolved)}` +
-      `&fields=name,rating,user_ratings_total,formatted_address,reviews` +
-      `&key=${apiKey}` +
-      `&reviews_sort=newest`;
+    let reviews        = [];
+    let businessName   = "Unknown";
+    let businessRating = null;
+    let totalRatings   = null;
+    let address        = "";
+    let source;
 
-    const r    = await fetch(detailsUrl, { signal: AbortSignal.timeout(15000) });
-    const data = await r.json();
+    if (serpApiKey) {
+      // ── SerpAPI path (up to 1000 reviews via pagination) ──────
+      const { reviews: serpReviews, placeInfo, pageCount } =
+        await fetchReviewsViaSerpApi(resolved, maxReviews, serpApiKey);
 
-    if (data.status === "NOT_FOUND" || data.status === "INVALID_REQUEST") {
-      return res.status(400).json({
-        error: `Place not found (Google API status: ${data.status}). Verify the Place ID or URL.`,
-      });
+      businessName   = placeInfo.title   || placeInfo.name  || "Unknown";
+      businessRating = placeInfo.rating  || null;
+      totalRatings   = placeInfo.reviews || null;
+      address        = placeInfo.address || "";
+      source         = "serpapi";
+
+      // PHI-safe — only log business name and counts
+      console.log(`[scan-reviews] SerpAPI OK place_id=${resolved} name="${businessName}" pages=${pageCount} reviews=${serpReviews.length}`);
+
+      reviews = serpReviews.map(rv => ({
+        author:     rv.user?.name        || "Anonymous",
+        rating:     rv.rating            || 0,
+        reviewText: rv.snippet           || "",
+        reviewTime: rv.date              || rv.iso_date || "",
+        response:   rv.response?.snippet || null,
+      }));
+
+    } else {
+      // ── Google Places API fallback (hard limit: 5 reviews) ────
+      const detailsUrl =
+        `https://maps.googleapis.com/maps/api/place/details/json` +
+        `?place_id=${encodeURIComponent(resolved)}` +
+        `&fields=name,rating,user_ratings_total,formatted_address,reviews` +
+        `&key=${apiKey}` +
+        `&reviews_sort=newest`;
+
+      const r    = await fetch(detailsUrl, { signal: AbortSignal.timeout(15000) });
+      const data = await r.json();
+
+      if (data.status === "NOT_FOUND" || data.status === "INVALID_REQUEST") {
+        return res.status(400).json({
+          error: `Place not found (Google API status: ${data.status}). Verify the Place ID or URL.`,
+        });
+      }
+      if (data.status !== "OK") {
+        return res.status(502).json({
+          error:  `Google Places API error: ${data.status}`,
+          detail: data.error_message || "",
+        });
+      }
+
+      const place  = data.result;
+      businessName   = place.name;
+      businessRating = place.rating;
+      totalRatings   = place.user_ratings_total;
+      address        = place.formatted_address;
+      source         = "google_places";
+
+      console.log(`[scan-reviews] Places OK place_id=${resolved} name="${businessName}" reviews=${(place.reviews||[]).length}`);
+
+      reviews = (place.reviews || []).map(rv => ({
+        author:     rv.author_name || "Anonymous",
+        rating:     rv.rating,
+        reviewText: rv.text || "",
+        reviewTime: rv.relative_time_description || "",
+        response:   rv.author_reply?.text || null,
+      }));
     }
-    if (data.status !== "OK") {
-      return res.status(502).json({
-        error:  `Google Places API error: ${data.status}`,
-        detail: data.error_message || "",
-      });
-    }
 
-    const place   = data.result;
-    const reviews = place.reviews || [];
-
-    // Log business name only — never log review text or PHI
-    console.log(`[scan-reviews] OK place_id=${resolved} name="${place.name}" reviews=${reviews.length}`);
-
+    // ── HIPAA Analysis ──────────────────────────────────────────
     const analyzed = reviews.map(rv => {
-      const responseText = rv.author_reply?.text || null;
-      const analysis    = analyzeHipaaResponse(responseText);
+      const analysis = analyzeHipaaResponse(rv.response);
       return {
-        author:       rv.author_name,
-        rating:       rv.rating,
-        reviewText:   rv.text,
-        reviewTime:   rv.relative_time_description,
-        response:     responseText,
+        ...rv,
         hipaaRisk:    analysis.risk,
         violations:   analysis.violations,
         riskScore:    analysis.score,
@@ -719,12 +830,13 @@ app.post("/scan-reviews", async (req, res) => {
       avgScore > 30 ? "MEDIUM" :
       avgScore > 0  ? "LOW"    : "CLEAN";
 
-    return res.json({
+    const result = {
       success:          true,
-      businessName:     place.name,
-      businessRating:   place.rating,
-      totalRatings:     place.user_ratings_total,
-      address:          place.formatted_address,
+      source,
+      businessName,
+      businessRating,
+      totalRatings,
+      address,
       overallRiskScore: avgScore,
       overallRiskLevel,
       riskSummary: {
@@ -734,16 +846,21 @@ app.post("/scan-reviews", async (req, res) => {
         clean:      withResponses.filter(r => r.hipaaRisk === "CLEAN").length,
         noResponse: analyzed.filter(r => !r.response).length,
       },
-      reviewCount: reviews.length,
+      reviewCount: analyzed.length,
+      maxReviews,
       reviews:     analyzed,
       timestamp:   new Date().toISOString(),
       disclaimer:
         "This analysis is for informational purposes only and does not constitute legal advice. " +
         "Consult a HIPAA compliance attorney for formal guidance.",
-    });
+    };
+
+    scanCache.set(cacheKey, { result, cachedAt: Date.now() });
+    return res.json(result);
+
   } catch (err) {
     // Never log review content — only the error message
-    console.error("[scan-reviews] fetch error:", err.message);
+    console.error("[scan-reviews] error:", err.message);
     return res.status(500).json({
       error:  "Review scan failed. Please try again.",
       detail: err.message,
@@ -785,17 +902,20 @@ app.get("/test/analyze-response", (_req, res) => {
 });
 
 app.get("/test/scan-reviews", (_req, res) => {
-  const keyPresent = !!process.env.GOOGLE_PLACES_API_KEY;
+  const placesKeyPresent = !!process.env.GOOGLE_PLACES_API_KEY;
+  const serpKeyPresent   = !!process.env.SERPAPI_KEY;
   return res.json({
-    test:          "scan-reviews",
-    apiKeyPresent: keyPresent,
-    status:        keyPresent
+    test:               "scan-reviews",
+    googlePlacesKey:    placesKeyPresent ? "SET ✓" : "MISSING ✗",
+    serpApiKey:         serpKeyPresent   ? "SET ✓ (up to 1000 reviews)" : "NOT SET (will use Google Places — max 5 reviews)",
+    activeSource:       serpKeyPresent   ? "serpapi" : "google_places",
+    status:             placesKeyPresent
       ? "CONFIG OK ✓ — POST /scan-reviews with a real placeId to test end-to-end"
       : "MISSING KEY — set GOOGLE_PLACES_API_KEY in Railway environment variables",
     exampleRequest: {
-      url:    "POST /scan-reviews",
-      body:   { placeId: "ChIJN1t_tDeuEmsRUsoyG83frY4" },
-      or:     { mapsUrl: "https://www.google.com/maps/place/Google+Sydney/@-33.8,151.1,15z/..." },
+      url:  "POST /scan-reviews",
+      body: { placeId: "ChIJN1t_tDeuEmsRUsoyG83frY4", maxReviews: 100 },
+      or:   { mapsUrl: "https://www.google.com/maps/place/Google+Sydney/@-33.8,151.1,15z/...", maxReviews: 500 },
     },
   });
 });

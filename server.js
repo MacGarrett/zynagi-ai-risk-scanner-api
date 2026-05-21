@@ -6,6 +6,11 @@ const cron        = require("node-cron");
 const app     = express();
 const VERSION = "2.4";
 
+// Startup diagnostics — visible in Railway deployment logs
+console.log("[startup] VERSION:", VERSION);
+console.log("[startup] SERPAPI_KEY present:", !!process.env.SERPAPI_KEY, "| length:", (process.env.SERPAPI_KEY || "").length);
+console.log("[startup] GOOGLE_PLACES_API_KEY present:", !!process.env.GOOGLE_PLACES_API_KEY);
+
 // ─────────────────────────────────────────────
 // CORS
 // Allow: zynagi.com, base44.com subdomains, railway.app previews, localhost

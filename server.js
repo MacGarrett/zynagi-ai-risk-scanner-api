@@ -5,7 +5,7 @@ const cron        = require("node-cron");
 const { randomUUID } = require("crypto");
 
 const app     = express();
-const VERSION = "2.5";
+const VERSION = "2.6";
 
 // Startup diagnostics — visible in Railway deployment logs
 console.log("[startup] VERSION:", VERSION);
@@ -923,7 +923,17 @@ app.post("/scan-reviews", async (req, res) => {
     }
 
     // ── HIPAA Analysis ──────────────────────────────────────────
+    // Fast path: skip regex engine for reviews with no owner response
     const analyzed = reviews.map(rv => {
+      if (!rv.response || !rv.response.trim()) {
+        return {
+          ...rv,
+          hipaaRisk:    "NO_RESPONSE",
+          violations:   [],
+          riskScore:    0,
+          safeResponse: generateSafeResponse(rv.rating),
+        };
+      }
       const analysis = analyzeHipaaResponse(rv.response);
       return {
         ...rv,
@@ -943,6 +953,14 @@ app.post("/scan-reviews", async (req, res) => {
       avgScore > 60 ? "HIGH"   :
       avgScore > 30 ? "MEDIUM" :
       avgScore > 0  ? "LOW"    : "CLEAN";
+
+    // Violation groupings for frontend toggle + export
+    const violationsOnlyReviews = analyzed.filter(r =>
+      r.hipaaRisk === "HIGH" || r.hipaaRisk === "MEDIUM" || r.hipaaRisk === "LOW"
+    );
+    const violationCount  = violationsOnlyReviews.length;
+    const cleanCount      = analyzed.filter(r => r.hipaaRisk === "CLEAN").length;
+    const noResponseCount = analyzed.filter(r => r.hipaaRisk === "NO_RESPONSE").length;
 
     const scanId = randomUUID();
 
@@ -965,6 +983,10 @@ app.post("/scan-reviews", async (req, res) => {
       },
       reviewCount: analyzed.length,
       maxReviews,
+      violationCount,
+      cleanCount,
+      noResponseCount,
+      violationsOnlyReviews,
       reviews:     analyzed,
       timestamp:   new Date().toISOString(),
       disclaimer:
@@ -1160,6 +1182,54 @@ app.get("/scan-history/:scanId/export-json", requireAdminKey, async (req, res) =
   res.setHeader("Content-Type", "application/json");
   res.setHeader("Content-Disposition", `attachment; filename="zynagi-hipaa-${safe}-${ts}-${scanId.slice(0,8)}.json"`);
   return res.send(JSON.stringify(fullResult, null, 2));
+});
+
+// GET /scan-history/:scanId/export-violations-json — violations only (HIGH/MEDIUM/LOW)
+app.get("/scan-history/:scanId/export-violations-json", requireAdminKey, async (req, res) => {
+  const { scanId } = req.params;
+  let fullResult, bizName, ts;
+
+  if (pgPool) {
+    try {
+      const { rows } = await pgPool.query(
+        "SELECT full_result, business_name, timestamp FROM scan_history WHERE scan_id = $1", [scanId]
+      );
+      if (!rows.length) return res.status(404).json({ success: false, error: "Scan not found" });
+      fullResult = rows[0].full_result;
+      bizName    = rows[0].business_name;
+      ts         = new Date(rows[0].timestamp).toISOString().split("T")[0];
+    } catch (err) {
+      return res.status(500).json({ success: false, error: "Database error" });
+    }
+  } else {
+    const entry = memHistory.get(scanId);
+    if (!entry) return res.status(404).json({ success: false, error: "Scan not found (server may have restarted)" });
+    fullResult = entry.fullResult;
+    bizName    = entry.meta.businessName;
+    ts         = new Date(entry.meta.timestamp).toISOString().split("T")[0];
+  }
+
+  const violationsOnly = fullResult.violationsOnlyReviews ||
+    (fullResult.reviews || []).filter(r =>
+      r.hipaaRisk === "HIGH" || r.hipaaRisk === "MEDIUM" || r.hipaaRisk === "LOW"
+    );
+
+  const exportData = {
+    businessName:         fullResult.businessName,
+    address:              fullResult.address,
+    scanId:               fullResult.scanId,
+    timestamp:            fullResult.timestamp,
+    overallRiskScore:     fullResult.overallRiskScore,
+    overallRiskLevel:     fullResult.overallRiskLevel,
+    riskSummary:          fullResult.riskSummary,
+    violationCount:       fullResult.violationCount ?? violationsOnly.length,
+    violationsOnlyReviews: violationsOnly,
+  };
+
+  const safe = (bizName || "scan").replace(/[^a-zA-Z0-9]/g, "_").slice(0, 30);
+  res.setHeader("Content-Type", "application/json");
+  res.setHeader("Content-Disposition", `attachment; filename="zynagi-violations-${safe}-${ts}-${scanId.slice(0,8)}.json"`);
+  return res.send(JSON.stringify(exportData, null, 2));
 });
 
 // ─────────────────────────────────────────────

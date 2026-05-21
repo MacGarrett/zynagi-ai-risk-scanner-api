@@ -2,14 +2,17 @@ const express     = require("express");
 const cors        = require("cors");
 const PDFDocument = require("pdfkit");
 const cron        = require("node-cron");
+const { randomUUID } = require("crypto");
 
 const app     = express();
-const VERSION = "2.4";
+const VERSION = "2.5";
 
 // Startup diagnostics — visible in Railway deployment logs
 console.log("[startup] VERSION:", VERSION);
 console.log("[startup] SERPAPI_KEY present:", !!process.env.SERPAPI_KEY, "| length:", (process.env.SERPAPI_KEY || "").length);
 console.log("[startup] GOOGLE_PLACES_API_KEY present:", !!process.env.GOOGLE_PLACES_API_KEY);
+console.log("[startup] DATABASE_URL present:", !!process.env.DATABASE_URL);
+console.log("[startup] ADMIN_SCAN_HISTORY_KEY configured:", !!process.env.ADMIN_SCAN_HISTORY_KEY);
 
 // ─────────────────────────────────────────────
 // CORS
@@ -51,10 +54,109 @@ const scanCache     = new Map();
 const CACHE_TTL_MS  = 12 * 60 * 60 * 1000; // 12 h
 
 const rateLimitMap   = new Map();
-const RATE_LIMIT_MAX = 5;
+const RATE_LIMIT_MAX = 50;             // 50/hr per IP (raised for dev/testing; was 5)
 const RATE_LIMIT_MS  = 60 * 60 * 1000; // 1 h
 
 let pagespeedFallbackMode = false;
+
+// ─────────────────────────────────────────────
+// SCAN HISTORY STORAGE
+// Uses Postgres when DATABASE_URL is set; falls back to bounded in-memory Map.
+// ─────────────────────────────────────────────
+let pgPool = null;
+const MEM_HISTORY_MAX  = 500;
+const memHistory       = new Map();   // scanId → { meta, fullResult }
+const memHistoryKeys   = [];          // insertion order, oldest first
+
+if (process.env.DATABASE_URL) {
+  const { Pool } = require("pg");
+  pgPool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.DATABASE_URL.includes("localhost")
+      ? false
+      : { rejectUnauthorized: false },
+  });
+  pgPool.query(`
+    CREATE TABLE IF NOT EXISTS scan_history (
+      scan_id            TEXT PRIMARY KEY,
+      timestamp          TIMESTAMPTZ DEFAULT NOW(),
+      business_name      TEXT,
+      address            TEXT,
+      place_id           TEXT,
+      maps_url           TEXT,
+      source             TEXT,
+      max_reviews        INT,
+      review_count       INT,
+      overall_risk_score INT,
+      overall_risk_level TEXT,
+      risk_summary       JSONB,
+      full_result        JSONB
+    )
+  `)
+  .then(() => console.log("[db] scan_history table ready"))
+  .catch(err => console.error("[db] table creation failed:", err.message));
+}
+
+// Admin key guard — protects /scan-history endpoints
+function requireAdminKey(req, res, next) {
+  const required = process.env.ADMIN_SCAN_HISTORY_KEY;
+  if (!required) return next(); // no key configured → open (dev mode)
+  const provided = req.headers["x-admin-key"] || req.query.key;
+  if (provided !== required) {
+    return res.status(403).json({ success: false, error: "Unauthorized. Supply x-admin-key header." });
+  }
+  next();
+}
+
+// Save a completed scan (PHI-safe: never logs review text)
+async function saveScanHistory(scanId, data) {
+  const meta = {
+    scanId,
+    timestamp:         data.timestamp || new Date().toISOString(),
+    businessName:      data.businessName,
+    address:           data.address,
+    placeId:           data._placeId   || null,
+    mapsUrl:           data._mapsUrl   || null,
+    source:            data.source,
+    maxReviews:        data.maxReviews,
+    reviewCount:       data.reviewCount,
+    overallRiskScore:  data.overallRiskScore,
+    overallRiskLevel:  data.overallRiskLevel,
+    riskSummary:       data.riskSummary,
+  };
+
+  if (pgPool) {
+    try {
+      await pgPool.query(
+        `INSERT INTO scan_history
+           (scan_id,timestamp,business_name,address,place_id,maps_url,
+            source,max_reviews,review_count,overall_risk_score,overall_risk_level,
+            risk_summary,full_result)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+         ON CONFLICT (scan_id) DO NOTHING`,
+        [
+          scanId, meta.timestamp, meta.businessName, meta.address,
+          meta.placeId, meta.mapsUrl, meta.source, meta.maxReviews,
+          meta.reviewCount, meta.overallRiskScore, meta.overallRiskLevel,
+          JSON.stringify(meta.riskSummary), JSON.stringify(data),
+        ]
+      );
+      // PHI-safe log — business name only, never review content
+      console.log(`[history] saved scanId=${scanId} business="${meta.businessName}" storage=postgres`);
+    } catch (err) {
+      console.error("[history] postgres save failed:", err.message);
+    }
+  } else {
+    // In-memory: evict oldest if full
+    if (memHistoryKeys.length >= MEM_HISTORY_MAX) {
+      const oldest = memHistoryKeys.shift();
+      memHistory.delete(oldest);
+    }
+    memHistory.set(scanId, { meta, fullResult: data });
+    memHistoryKeys.push(scanId);
+    console.log(`[history] saved scanId=${scanId} business="${meta.businessName}" storage=memory (${memHistory.size}/${MEM_HISTORY_MAX})`);
+  }
+}
 
 // ─────────────────────────────────────────────
 // GENERIC HELPERS
@@ -142,6 +244,9 @@ function healthPayload() {
     rateLimitPolicy:      `${RATE_LIMIT_MAX} scans / hour per IP`,
     cacheTTL:             "12 hours",
     serpApiEnabled:       !!process.env.SERPAPI_KEY,
+    historyStorage:       pgPool ? "postgres" : "memory",
+    historyCount:         pgPool ? null : memHistory.size,
+    adminKeyConfigured:   !!process.env.ADMIN_SCAN_HISTORY_KEY,
   };
 }
 
@@ -706,7 +811,11 @@ app.post("/scan-reviews", async (req, res) => {
   const ip = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() ||
              req.socket.remoteAddress || "unknown";
   if (!checkRateLimit(ip)) {
-    return res.status(429).json({ error: "Too many scans. Please wait and try again." });
+    return res.status(429).json({
+      success:            false,
+      error:              "Too many scans. Please wait and try again.",
+      retryAfterMinutes:  60,
+    });
   }
 
   const apiKey     = process.env.GOOGLE_PLACES_API_KEY;
@@ -835,8 +944,11 @@ app.post("/scan-reviews", async (req, res) => {
       avgScore > 30 ? "MEDIUM" :
       avgScore > 0  ? "LOW"    : "CLEAN";
 
+    const scanId = randomUUID();
+
     const result = {
       success:          true,
+      scanId,
       source,
       businessName,
       businessRating,
@@ -858,7 +970,13 @@ app.post("/scan-reviews", async (req, res) => {
       disclaimer:
         "This analysis is for informational purposes only and does not constitute legal advice. " +
         "Consult a HIPAA compliance attorney for formal guidance.",
+      // internal fields used by saveScanHistory (not surfaced in UI)
+      _placeId: resolved,
+      _mapsUrl: mapsUrl || null,
     };
+
+    // Save to history (PHI-safe — function never logs review text)
+    await saveScanHistory(scanId, result);
 
     scanCache.set(cacheKey, { result, cachedAt: Date.now() });
     return res.json(result);
@@ -923,6 +1041,125 @@ app.get("/test/scan-reviews", (_req, res) => {
       or:   { mapsUrl: "https://www.google.com/maps/place/Google+Sydney/@-33.8,151.1,15z/...", maxReviews: 500 },
     },
   });
+});
+
+// ─────────────────────────────────────────────
+// SCAN HISTORY ENDPOINTS
+// All require x-admin-key header if ADMIN_SCAN_HISTORY_KEY env var is set.
+// ─────────────────────────────────────────────
+
+// GET /scan-history — list recent scans, newest first
+app.get("/scan-history", requireAdminKey, async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+
+  if (pgPool) {
+    try {
+      const { rows } = await pgPool.query(
+        `SELECT scan_id, timestamp, business_name, address, source,
+                max_reviews, review_count, overall_risk_score,
+                overall_risk_level, risk_summary
+           FROM scan_history
+          ORDER BY timestamp DESC
+          LIMIT $1`,
+        [limit]
+      );
+      return res.json({
+        success: true,
+        storage: "postgres",
+        count:   rows.length,
+        scans:   rows.map(r => ({
+          scanId:           r.scan_id,
+          timestamp:        r.timestamp,
+          businessName:     r.business_name,
+          address:          r.address,
+          source:           r.source,
+          maxReviews:       r.max_reviews,
+          reviewCount:      r.review_count,
+          overallRiskScore: r.overall_risk_score,
+          overallRiskLevel: r.overall_risk_level,
+          riskSummary:      r.risk_summary,
+        })),
+      });
+    } catch (err) {
+      console.error("[history] GET /scan-history postgres error:", err.message);
+      return res.status(500).json({ success: false, error: "Database error" });
+    }
+  } else {
+    const keys   = [...memHistoryKeys].reverse().slice(0, limit); // newest first
+    return res.json({
+      success: true,
+      storage: "memory",
+      warning: "In-memory storage: scans are lost on server restart. Add Railway Postgres (DATABASE_URL) for persistence.",
+      count:   keys.length,
+      scans:   keys.map(k => {
+        const { meta } = memHistory.get(k);
+        return {
+          scanId:           meta.scanId,
+          timestamp:        meta.timestamp,
+          businessName:     meta.businessName,
+          address:          meta.address,
+          source:           meta.source,
+          maxReviews:       meta.maxReviews,
+          reviewCount:      meta.reviewCount,
+          overallRiskScore: meta.overallRiskScore,
+          overallRiskLevel: meta.overallRiskLevel,
+          riskSummary:      meta.riskSummary,
+        };
+      }),
+    });
+  }
+});
+
+// GET /scan-history/:scanId — full scan result
+app.get("/scan-history/:scanId", requireAdminKey, async (req, res) => {
+  const { scanId } = req.params;
+
+  if (pgPool) {
+    try {
+      const { rows } = await pgPool.query(
+        "SELECT full_result FROM scan_history WHERE scan_id = $1", [scanId]
+      );
+      if (!rows.length) return res.status(404).json({ success: false, error: "Scan not found" });
+      return res.json({ success: true, storage: "postgres", ...rows[0].full_result });
+    } catch (err) {
+      return res.status(500).json({ success: false, error: "Database error" });
+    }
+  } else {
+    const entry = memHistory.get(scanId);
+    if (!entry) return res.status(404).json({ success: false, error: "Scan not found (server may have restarted)" });
+    return res.json({ success: true, storage: "memory", ...entry.fullResult });
+  }
+});
+
+// GET /scan-history/:scanId/export-json — download full scan as JSON file
+app.get("/scan-history/:scanId/export-json", requireAdminKey, async (req, res) => {
+  const { scanId } = req.params;
+  let fullResult, bizName, ts;
+
+  if (pgPool) {
+    try {
+      const { rows } = await pgPool.query(
+        "SELECT full_result, business_name, timestamp FROM scan_history WHERE scan_id = $1", [scanId]
+      );
+      if (!rows.length) return res.status(404).json({ success: false, error: "Scan not found" });
+      fullResult = rows[0].full_result;
+      bizName    = rows[0].business_name;
+      ts         = new Date(rows[0].timestamp).toISOString().split("T")[0];
+    } catch (err) {
+      return res.status(500).json({ success: false, error: "Database error" });
+    }
+  } else {
+    const entry = memHistory.get(scanId);
+    if (!entry) return res.status(404).json({ success: false, error: "Scan not found (server may have restarted)" });
+    fullResult = entry.fullResult;
+    bizName    = entry.meta.businessName;
+    ts         = new Date(entry.meta.timestamp).toISOString().split("T")[0];
+  }
+
+  const safe = (bizName || "scan").replace(/[^a-zA-Z0-9]/g, "_").slice(0, 30);
+  res.setHeader("Content-Type", "application/json");
+  res.setHeader("Content-Disposition", `attachment; filename="zynagi-hipaa-${safe}-${ts}-${scanId.slice(0,8)}.json"`);
+  return res.send(JSON.stringify(fullResult, null, 2));
 });
 
 // ─────────────────────────────────────────────

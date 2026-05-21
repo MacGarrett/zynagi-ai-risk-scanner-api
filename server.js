@@ -5,7 +5,7 @@ const cron        = require("node-cron");
 const { randomUUID } = require("crypto");
 
 const app     = express();
-const VERSION = "2.6";
+const VERSION = "2.7";
 
 // Startup diagnostics — visible in Railway deployment logs
 console.log("[startup] VERSION:", VERSION);
@@ -13,6 +13,7 @@ console.log("[startup] SERPAPI_KEY present:", !!process.env.SERPAPI_KEY, "| leng
 console.log("[startup] GOOGLE_PLACES_API_KEY present:", !!process.env.GOOGLE_PLACES_API_KEY);
 console.log("[startup] DATABASE_URL present:", !!process.env.DATABASE_URL);
 console.log("[startup] ADMIN_SCAN_HISTORY_KEY configured:", !!process.env.ADMIN_SCAN_HISTORY_KEY);
+console.log("[startup] SCANNER_ACCESS_PASSWORD configured:", !!process.env.SCANNER_ACCESS_PASSWORD);
 
 // ─────────────────────────────────────────────
 // CORS
@@ -56,6 +57,12 @@ const CACHE_TTL_MS  = 12 * 60 * 60 * 1000; // 12 h
 const rateLimitMap   = new Map();
 const RATE_LIMIT_MAX = 50;             // 50/hr per IP (raised for dev/testing; was 5)
 const RATE_LIMIT_MS  = 60 * 60 * 1000; // 1 h
+
+// Access gate: lead capture + password attempt rate limits
+const accessRequests   = [];         // in-memory lead store (max 200)
+const ACCESS_REQ_MAX   = 200;
+const accessReqRateMap = new Map();  // 5 requests/hr/IP
+const accessPwdRateMap = new Map();  // 10 password attempts/hr/IP
 
 let pagespeedFallbackMode = false;
 
@@ -227,6 +234,19 @@ function checkRateLimit(ip) {
     return true;
   }
   if (entry.count >= RATE_LIMIT_MAX) return false;
+  entry.count++;
+  return true;
+}
+
+// Generic rate limiter for access gate endpoints
+function checkCustomRate(map, ip, max, windowMs) {
+  const now   = Date.now();
+  const entry = map.get(ip);
+  if (!entry || now > entry.resetAt) {
+    map.set(ip, { count: 1, resetAt: now + windowMs });
+    return true;
+  }
+  if (entry.count >= max) return false;
   entry.count++;
   return true;
 }
@@ -1230,6 +1250,94 @@ app.get("/scan-history/:scanId/export-violations-json", requireAdminKey, async (
   res.setHeader("Content-Type", "application/json");
   res.setHeader("Content-Disposition", `attachment; filename="zynagi-violations-${safe}-${ts}-${scanId.slice(0,8)}.json"`);
   return res.send(JSON.stringify(exportData, null, 2));
+});
+
+// ─────────────────────────────────────────────
+// SCANNER ACCESS GATE
+// POST /scanner-access-request  — lead capture (rate limited: 5/hr/IP)
+// POST /scanner-access-verify   — password check (rate limited: 10/hr/IP)
+// GET  /scanner-access-requests — admin view of stored leads
+// ─────────────────────────────────────────────
+
+app.post("/scanner-access-request", (req, res) => {
+  const ip = req.headers["x-forwarded-for"]?.split(",")[0]?.trim()
+           || req.socket.remoteAddress || "unknown";
+
+  if (!checkCustomRate(accessReqRateMap, ip, 5, RATE_LIMIT_MS)) {
+    return res.status(429).json({
+      success: false,
+      error:   "Too many access requests. Please try again later.",
+    });
+  }
+
+  const { name, email, company, website, role, locationCount, message } = req.body || {};
+  if (!name || !email) {
+    return res.status(400).json({ success: false, error: "Name and email are required." });
+  }
+
+  const record = {
+    id:            randomUUID(),
+    timestamp:     new Date().toISOString(),
+    name:          String(name).slice(0, 120),
+    email:         String(email).slice(0, 200),
+    company:       String(company       || "").slice(0, 200),
+    website:       String(website       || "").slice(0, 300),
+    role:          String(role          || "").slice(0, 120),
+    locationCount: String(locationCount || "").slice(0,  20),
+    message:       String(message       || "").slice(0, 1000),
+    ip,
+  };
+
+  // Evict oldest if at capacity
+  if (accessRequests.length >= ACCESS_REQ_MAX) accessRequests.shift();
+  accessRequests.push(record);
+
+  console.log(`[access-request] name="${record.name}" email="${record.email}" company="${record.company}" ip=${ip}`);
+
+  return res.json({
+    success: true,
+    message: "Request received. Our team will review your request and send access instructions.",
+  });
+});
+
+app.post("/scanner-access-verify", (req, res) => {
+  const ip = req.headers["x-forwarded-for"]?.split(",")[0]?.trim()
+           || req.socket.remoteAddress || "unknown";
+
+  if (!checkCustomRate(accessPwdRateMap, ip, 10, RATE_LIMIT_MS)) {
+    return res.status(429).json({
+      success: false,
+      error:   "Too many attempts. Please try again later.",
+    });
+  }
+
+  const password = process.env.SCANNER_ACCESS_PASSWORD;
+  if (!password) {
+    // Gate not configured — open access (staging / disable gate)
+    return res.json({ success: true });
+  }
+
+  const { code } = req.body || {};
+  if (!code || String(code) !== password) {
+    return res.status(403).json({
+      success: false,
+      error:   "Invalid access code. Please request access.",
+    });
+  }
+
+  console.log(`[access-verify] successful unlock ip=${ip}`);
+  return res.json({ success: true });
+});
+
+// Admin endpoint: view captured access leads
+app.get("/scanner-access-requests", requireAdminKey, (req, res) => {
+  return res.json({
+    success:  true,
+    count:    accessRequests.length,
+    storage:  "memory",
+    warning:  "Leads are in-memory and lost on server restart. Export regularly.",
+    requests: [...accessRequests].reverse(), // newest first
+  });
 });
 
 // ─────────────────────────────────────────────

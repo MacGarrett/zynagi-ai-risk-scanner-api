@@ -5,7 +5,7 @@ const cron        = require("node-cron");
 const { randomUUID } = require("crypto");
 
 const app     = express();
-const VERSION = "2.7";
+const VERSION = "2.8";
 
 // Startup diagnostics — visible in Railway deployment logs
 console.log("[startup] VERSION:", VERSION);
@@ -52,7 +52,14 @@ app.use(express.json({ limit: "1mb" }));
 // ─────────────────────────────────────────────
 const monitoredUrls = new Map();
 const scanCache     = new Map();
-const CACHE_TTL_MS  = 12 * 60 * 60 * 1000; // 12 h
+
+// Normal scan cache TTL — default 30 min; override with SCAN_CACHE_TTL_MINUTES env var
+const CACHE_TTL_MS = (parseInt(process.env.SCAN_CACHE_TTL_MINUTES) || 30) * 60 * 1000;
+
+// Duplicate-scan window — per-IP short-term protection; default 5 min
+// Prevents accidental repeat scans from burning SerpAPI quota.
+const DUP_SCAN_MS  = (parseInt(process.env.DUPLICATE_SCAN_WINDOW_MINUTES) || 5) * 60 * 1000;
+const dupScanCache = new Map(); // `${ip}:reviews:${placeId}:${maxReviews}` → timestamp
 
 const rateLimitMap   = new Map();
 const RATE_LIMIT_MAX = 50;             // 50/hr per IP (raised for dev/testing; was 5)
@@ -262,7 +269,8 @@ function healthPayload() {
     cacheSize:            scanCache.size,
     monitoredCount:       monitoredUrls.size,
     rateLimitPolicy:      `${RATE_LIMIT_MAX} scans / hour per IP`,
-    cacheTTL:             "12 hours",
+    cacheTTL:             `${CACHE_TTL_MS / 60000} minutes`,
+    dupScanWindow:        `${DUP_SCAN_MS / 60000} minutes`,
     serpApiEnabled:       !!process.env.SERPAPI_KEY,
     historyStorage:       pgPool ? "postgres" : "memory",
     historyCount:         pgPool ? null : memHistory.size,
@@ -818,7 +826,7 @@ async function fetchReviewsViaSerpApi(placeId, maxReviews, serpApiKey) {
 // Falls back to Google Places API (max 5 reviews) if not.
 // ─────────────────────────────────────────────
 app.post("/scan-reviews", async (req, res) => {
-  const { placeId, mapsUrl, maxReviews: maxReviewsRaw } = req.body;
+  const { placeId, mapsUrl, maxReviews: maxReviewsRaw, forceRefresh } = req.body;
   const rawInput   = placeId || mapsUrl;
   const maxReviews = Math.max(1, Math.min(parseInt(maxReviewsRaw) || 100, 1000));
 
@@ -864,10 +872,40 @@ app.post("/scan-reviews", async (req, res) => {
 
   // Cache key includes maxReviews so different limits get separate entries
   const cacheKey = `reviews:${resolved}:${maxReviews}`;
-  const cached   = scanCache.get(cacheKey);
-  if (cached && Date.now() - cached.cachedAt < CACHE_TTL_MS) {
-    console.log(`[Cache] HIT reviews place_id=${resolved} maxReviews=${maxReviews}`);
-    return res.json({ ...cached.result, fromCache: true, cachedAt: new Date(cached.cachedAt).toISOString() });
+  const dupKey   = `${ip}:${cacheKey}`;
+
+  if (!forceRefresh) {
+    // ── Normal shared cache (default 30 min) ───────────────────────
+    const cached = scanCache.get(cacheKey);
+    if (cached && Date.now() - cached.cachedAt < CACHE_TTL_MS) {
+      const ageMs = Date.now() - cached.cachedAt;
+      console.log(`[Cache] HIT reviews place_id=${resolved} maxReviews=${maxReviews} age=${Math.round(ageMs/60000)}min`);
+      return res.json({
+        ...cached.result,
+        cached:          true,
+        cacheAgeMinutes: Math.round(ageMs / 60000),
+        forceRefresh:    false,
+      });
+    }
+
+    // ── Duplicate-scan window (per-IP, default 5 min) ───────────────
+    const lastDup = dupScanCache.get(dupKey);
+    if (lastDup && Date.now() - lastDup < DUP_SCAN_MS) {
+      const ageMs = Date.now() - lastDup;
+      // If a shared cache entry exists (just not within normal TTL), return it
+      const cachedFallback = scanCache.get(cacheKey);
+      if (cachedFallback) {
+        console.log(`[Cache] DUP-SCAN protection ip=${ip} place_id=${resolved}`);
+        return res.json({
+          ...cachedFallback.result,
+          cached:          true,
+          cacheAgeMinutes: Math.round((Date.now() - cachedFallback.cachedAt) / 60000),
+          forceRefresh:    false,
+        });
+      }
+    }
+  } else {
+    console.log(`[Cache] FORCE-REFRESH requested place_id=${resolved} ip=${ip}`);
   }
 
   try {
@@ -1020,8 +1058,16 @@ app.post("/scan-reviews", async (req, res) => {
     // Save to history (PHI-safe — function never logs review text)
     await saveScanHistory(scanId, result);
 
+    // Store in shared cache and mark this IP's last scan time
     scanCache.set(cacheKey, { result, cachedAt: Date.now() });
-    return res.json(result);
+    dupScanCache.set(dupKey, Date.now());
+
+    return res.json({
+      ...result,
+      cached:          false,
+      cacheAgeMinutes: 0,
+      forceRefresh:    !!forceRefresh,
+    });
 
   } catch (err) {
     // Never log review content — only the error message
